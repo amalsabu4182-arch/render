@@ -1,41 +1,56 @@
-import sqlite3
+import os
 from flask import Flask, request, jsonify, g, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-import os
+from sqlalchemy import create_engine, text, exc
 
 # --- Basic Flask App Setup ---
 app = Flask(__name__)
-# This is crucial for session security
-app.secret_key = os.urandom(24)
-DATABASE = 'attendance.db'
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
-# --- Database Functions ---
+# --- Database Connection ---
+# Render provides this DATABASE_URL as an environment variable
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
+
 def get_db():
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
-    return db
+    """Opens a new database connection if there is none yet for the current application context."""
+    if 'db' not in g:
+        g.db = engine.connect()
+    return g.db
 
 @app.teardown_appcontext
 def close_connection(exception):
-    db = getattr(g, '_database', None)
+    """Closes the database again at the end of the request."""
+    db = g.pop('db', None)
     if db is not None:
         db.close()
 
 def init_db():
+    """Initializes the database using the schema.sql file."""
     with app.app_context():
         db = get_db()
-        with app.open_resource('schema.sql', mode='r') as f:
-            db.cursor().executescript(f.read())
-        db.commit()
-        # Add a default admin user and a default class
-        hashed_password = generate_password_hash('adminpass')
-        db.execute('INSERT INTO admins (username, password) VALUES (?, ?)', ('admin', hashed_password))
-        db.execute('INSERT INTO classes (name) VALUES (?)', ('Default Class',))
-        db.commit()
-        print("Database initialized with default admin and class.")
+        # Use a transaction to ensure all commands succeed or none do.
+        with db.begin() as trans:
+            with app.open_resource('schema.sql', mode='r') as f:
+                # Execute the entire schema file
+                db.execute(text(f.read()))
+            
+            # Add a default admin user and a default class
+            hashed_password = generate_password_hash('adminpass')
+            db.execute(
+                text("INSERT INTO admins (username, password) VALUES (:user, :pw) ON CONFLICT (username) DO NOTHING"),
+                {'user': 'admin', 'pw': hashed_password}
+            )
+            db.execute(
+                text("INSERT INTO classes (name) VALUES (:name) ON CONFLICT (name) DO NOTHING"),
+                {'name': 'Default Class'}
+            )
+        print("Database initialized.")
+
 
 @app.cli.command('initdb')
 def initdb_command():
@@ -48,6 +63,17 @@ def login_required(role):
         def decorated_function(*args, **kwargs):
             if 'user_id' not in session or session.get('role') != role:
                 return jsonify({"success": False, "message": "Unauthorized"}), 401
+            # Add user object to g so routes can access it
+            db = get_db()
+            if role == 'admin':
+                result = db.execute(text("SELECT * FROM admins WHERE id = :id"), {'id': session['user_id']})
+            elif role == 'teacher':
+                result = db.execute(text("SELECT * FROM teachers WHERE id = :id"), {'id': session['user_id']})
+            elif role == 'student':
+                 result = db.execute(text("SELECT * FROM students WHERE id = :id"), {'id': session['user_id']})
+            g.user = result.fetchone()
+            if g.user is None:
+                return jsonify({"success": False, "message": "User not found"}), 401
             return f(*args, **kwargs)
         return decorated_function
     return decorator
@@ -63,44 +89,50 @@ def login():
     username = data.get('username')
     password = data.get('password')
     role = data.get('role')
-
     db = get_db()
     user = None
 
-    if role == 'admin':
-        user = db.execute('SELECT * FROM admins WHERE username = ?', (username,)).fetchone()
-    elif role == 'teacher':
-        user = db.execute('SELECT * FROM teachers WHERE email = ?', (username,)).fetchone()
-        if user and not user['is_approved']:
-            return jsonify({"success": False, "message": "Account not approved by admin."}), 403
-    elif role == 'student':
-        user = db.execute('SELECT * FROM students WHERE username = ?', (username,)).fetchone()
+    try:
+        if role == 'admin':
+            result = db.execute(text("SELECT * FROM admins WHERE username = :user"), {'user': username})
+            user = result.fetchone()
+        elif role == 'teacher':
+            result = db.execute(text("SELECT * FROM teachers WHERE email = :user"), {'user': username})
+            user = result.fetchone()
+            if user and not user.is_approved:
+                return jsonify({"success": False, "message": "Account not approved by admin."}), 403
+        elif role == 'student':
+            result = db.execute(text("SELECT * FROM students WHERE username = :user"), {'user': username})
+            user = result.fetchone()
 
+        if user and check_password_hash(user.password, password):
+            session['user_id'] = user.id
+            session['role'] = role
+            user_data = {
+                'id': user.id,
+                'name': getattr(user, 'name', user.username)
+            }
+            return jsonify({"success": True, "user": user_data})
+        else:
+            return jsonify({"success": False, "message": "Invalid username or password"}), 401
+    except exc.SQLAlchemyError as e:
+        # Log the error for debugging
+        print(f"Database error during login: {e}")
+        return jsonify({"success": False, "message": "A database error occurred."}), 500
 
-    if user and check_password_hash(user['password'], password):
-        session['user_id'] = user['id']
-        session['role'] = role
-        user_data = {
-            'id': user['id'],
-            'name': user.get('name', user['username']) # Use name if it exists, otherwise username
-        }
-        return jsonify({"success": True, "user": user_data})
-    else:
-        return jsonify({"success": False, "message": "Invalid username or password"}), 401
 
 @app.route('/api/logout', methods=['POST'])
 def logout():
     session.clear()
     return jsonify({"success": True, "message": "Logged out successfully."})
 
-
 # --- Admin Routes ---
 @app.route('/api/admin/pending_teachers', methods=['GET'])
 @login_required('admin')
 def get_pending_teachers():
     db = get_db()
-    teachers_cursor = db.execute('SELECT id, name, email FROM teachers WHERE is_approved = 0')
-    teachers = [dict(row) for row in teachers_cursor.fetchall()]
+    result = db.execute(text('SELECT id, name, email FROM teachers WHERE is_approved = false'))
+    teachers = [dict(row._mapping) for row in result.fetchall()]
     return jsonify({"teachers": teachers})
 
 @app.route('/api/admin/approve_teacher', methods=['POST'])
@@ -109,7 +141,7 @@ def approve_teacher():
     data = request.json
     teacher_id = data.get('teacher_id')
     db = get_db()
-    db.execute('UPDATE teachers SET is_approved = 1 WHERE id = ?', (teacher_id,))
+    db.execute(text('UPDATE teachers SET is_approved = true WHERE id = :id'), {'id': teacher_id})
     db.commit()
     return jsonify({"success": True, "message": "Teacher approved."})
 
@@ -118,14 +150,14 @@ def approve_teacher():
 @login_required('teacher')
 def get_teacher_students():
     db = get_db()
-    teacher = db.execute('SELECT class_id FROM teachers WHERE id = ?', (session['user_id'],)).fetchone()
-    if not teacher or not teacher['class_id']:
+    teacher = g.user # Get user from decorator
+    
+    if not teacher or not teacher.class_id:
          return jsonify({"error": "Teacher not assigned to a class"}), 404
 
-    students_cursor = db.execute('SELECT id, name FROM students WHERE class_id = ? ORDER BY name', (teacher['class_id'],))
-    students = [dict(row) for row in students_cursor.fetchall()]
+    result = db.execute(text('SELECT id, name FROM students WHERE class_id = :cid ORDER BY name'), {'cid': teacher.class_id})
+    students = [dict(row._mapping) for row in result.fetchall()]
     return jsonify({"students": students})
-
 
 # --- Student Routes ---
 @app.route('/api/student/data', methods=['GET'])
@@ -133,8 +165,8 @@ def get_teacher_students():
 def get_student_data():
     db = get_db()
     student_id = session['user_id']
-    records_cursor = db.execute('SELECT date, status, remarks FROM attendance WHERE student_id = ? ORDER BY date DESC', (student_id,))
-    records = [dict(row) for row in records_cursor.fetchall()]
+    result = db.execute(text('SELECT date, status, remarks FROM attendance WHERE student_id = :sid ORDER BY date DESC'), {'sid': student_id})
+    records = [dict(row._mapping) for row in result.fetchall()]
 
     present_days = sum(1 for r in records if r['status'] == 'Full Day')
     absent_days = sum(1 for r in records if r['status'] == 'Absent')
@@ -147,7 +179,4 @@ def get_student_data():
         "absent_days": absent_days,
         "percentage": round(percentage)
     })
-
-if __name__ == '__main__':
-    app.run(debug=True)
 
